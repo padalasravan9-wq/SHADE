@@ -1,0 +1,283 @@
+"""
+baselines/drl/a3c.py
+
+Asynchronous Advantage Actor-Critic (A3C) with R2N2 — DRL Baseline.
+
+Implements the A3C+R2N2 scheduling approach from:
+    Tuli, S., Ilager, S., Ramamohanarao, K., & Buyya, R. (2022).
+    Dynamic scheduling for stochastic edge-cloud computing environments
+    using A3C learning and residual recurrent neural networks.
+    IEEE Transactions on Mobile Computing, 21(3), 940-954.
+    DOI: 10.1109/TMC.2020.3017079. [Reference 8 in paper]
+
+Key structural differences from SHADE:
+    - Flat homogeneous state vector (same limitation as DDQN/PPO)
+    - Residual Recurrent Network (R2N2) for temporal modelling
+    - Asynchronous parallel workers (simulated here as sequential)
+    - Super-linear overhead scaling: β = 1.48 (vs SHADE: β = 0.21)
+    - No device-class capability encoding
+
+The R2N2 architecture uses residual connections within LSTM layers
+to stabilize gradient flow during training — a genuine advance over
+standard A3C — but still operates on the same homogeneous state
+that collapses Class A and Class D representations.
+
+Paper results:
+    Latency:  22.6 ± 0.8 ms (SHADE: 18.4 ± 0.5 ms, −18.6%)
+    Energy:   3.52 ± 0.11 kWh (SHADE: 3.44 ± 0.09 kWh)
+    Affinity: 0.71 (SHADE: 0.89, +0.18)
+    Overhead at 2,000 nodes: 186.4 ms (SHADE: 12.3 ms, 15.2× faster)
+
+Reference: Section 6.3, [8] in paper.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+from typing import List, Dict, Optional, Tuple
+
+
+class ResidualLSTMBlock(nn.Module):
+    """
+    Residual Recurrent Network (R2N2) block.
+
+    Applies an LSTM layer with a residual (skip) connection:
+        h_out = LSTM(h_in) + h_in  (if dimensions match)
+
+    The residual connection prevents vanishing gradients in deep
+    recurrent networks and stabilizes training in stochastic
+    edge-cloud environments with variable-length episodes.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.hidden_dim = hidden_dim
+
+        # Projection if dimensions differ (residual connection)
+        self.proj = (
+            nn.Linear(input_dim, hidden_dim)
+            if input_dim != hidden_dim
+            else nn.Identity()
+        )
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        hidden: Optional[Tuple] = None,
+    ) -> Tuple[torch.Tensor, Tuple]:
+        """
+        Args:
+            x: Input tensor (batch, seq_len, input_dim).
+            hidden: Optional (h_n, c_n) from previous step.
+
+        Returns:
+            out: (batch, seq_len, hidden_dim) with residual.
+            hidden: Updated (h_n, c_n).
+        """
+        lstm_out, hidden = self.lstm(x, hidden)
+        residual = self.proj(x)
+        out = self.layer_norm(lstm_out + residual)
+        return out, hidden
+
+
+class A3CR2N2Network(nn.Module):
+    """
+    A3C Actor-Critic network with R2N2 temporal modelling.
+
+    Architecture (from Tuli et al. 2022):
+        - FC(256) → R2N2(LSTM(256) + residual) → FC(128)
+        - Actor head: n_actions logits
+        - Critic head: scalar value estimate
+
+    Operates on flat homogeneous state: [cpu_util, queue_depth] per node.
+    """
+
+    def __init__(self, state_dim: int, n_actions: int, hidden_dim: int = 256):
+        super().__init__()
+
+        self.fc_in = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+        )
+
+        self.r2n2 = ResidualLSTMBlock(hidden_dim, hidden_dim)
+
+        self.fc_mid = nn.Sequential(
+            nn.Linear(hidden_dim, 128),
+            nn.ReLU(),
+        )
+
+        self.actor = nn.Linear(128, n_actions)
+        self.critic = nn.Linear(128, 1)
+
+        self._hidden = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        reset_hidden: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if reset_hidden:
+            self._hidden = None
+
+        h = self.fc_in(x)  # (batch, hidden_dim)
+        h_seq = h.unsqueeze(1)  # (batch, 1, hidden_dim) for LSTM
+
+        r2n2_out, self._hidden = self.r2n2(h_seq, self._hidden)
+        h = r2n2_out.squeeze(1)  # (batch, hidden_dim)
+
+        h = self.fc_mid(h)
+        logits = self.actor(h)
+        value = self.critic(h).squeeze(-1)
+        return logits, value
+
+
+class A3CScheduler:
+    """
+    A3C+R2N2 scheduler — the strongest DRL baseline in the paper.
+
+    Uses asynchronous-style updates (simulated sequentially for
+    fair single-machine comparison). The R2N2 recurrent architecture
+    provides temporal modelling of task arrival patterns, but the
+    homogeneous state representation limits capability-aware routing.
+
+    SHADE's sub-agent also uses an LSTM for temporal modelling, but
+    combines it with the class-aware state encoder — the component
+    responsible for the +0.18 affinity score improvement over A3C.
+
+    Overhead scaling: A3C uses a centralized single agent that must
+    observe all N nodes simultaneously, producing super-linear scaling
+    (β = 1.48). At 2,000 nodes, overhead reaches 186.4 ms vs 12.3 ms
+    for SHADE's decentralized hierarchical architecture.
+    """
+
+    def __init__(
+        self,
+        n_nodes: int,
+        gamma: float = 0.99,
+        lr: float = 1e-4,
+        entropy_coef: float = 0.01,
+        value_coef: float = 0.5,
+        max_grad_norm: float = 40.0,
+        n_steps: int = 20,         # A3C rollout length
+    ):
+        self.name = 'A3C'
+        self.n_nodes = n_nodes
+        self.gamma = gamma
+        self.entropy_coef = entropy_coef
+        self.value_coef = value_coef
+        self.max_grad_norm = max_grad_norm
+        self.n_steps = n_steps
+
+        # Flat homogeneous state: N×2 + 2 task features
+        self.state_dim = n_nodes * 2 + 2
+        self.n_actions = n_nodes
+
+        self.net = A3CR2N2Network(self.state_dim, self.n_actions)
+        self.optimizer = optim.RMSprop(
+            self.net.parameters(), lr=lr, alpha=0.99, eps=1e-5
+        )
+
+        # Rollout storage
+        self._states: list = []
+        self._actions: list = []
+        self._rewards: list = []
+        self._values: list = []
+        self._log_probs: list = []
+        self._dones: list = []
+
+        self.steps = 0
+        self._encode = __import__(
+            'baselines.drl.ddqn', fromlist=['HomogeneousStateEncoder']
+        ).HomogeneousStateEncoder()
+
+    def select_node(
+        self,
+        task: Dict,
+        nodes: List[Dict],
+        training: bool = False,
+    ) -> int:
+        """Select node using A3C+R2N2 policy."""
+        state = self._encode.encode(task, nodes)
+        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+
+        logits, value = self.net(state_t)
+        dist = Categorical(logits=logits)
+
+        if training:
+            action = dist.sample()
+            self._states.append(state)
+            self._actions.append(action.item())
+            self._values.append(value.item())
+            self._log_probs.append(dist.log_prob(action).item())
+            self.steps += 1
+            return action.item()
+        else:
+            with torch.no_grad():
+                return int(logits.argmax(dim=1).item())
+
+    def store_reward(self, reward: float, done: bool):
+        self._rewards.append(reward)
+        self._dones.append(done)
+
+    def update(self, bootstrap_value: float = 0.0) -> Optional[float]:
+        """
+        A3C n-step return update.
+
+        Computes n-step returns with bootstrap value for non-terminal
+        states. Updates both actor and critic using the advantage
+        A_t = R_t - V(s_t).
+        """
+        if len(self._rewards) < self.n_steps:
+            return None
+
+        # Compute n-step returns
+        R = bootstrap_value
+        returns = []
+        for r, done in zip(reversed(self._rewards), reversed(self._dones)):
+            R = r + self.gamma * R * (1 - done)
+            returns.insert(0, R)
+
+        states_t = torch.tensor(np.array(self._states), dtype=torch.float32)
+        actions_t = torch.tensor(self._actions, dtype=torch.long)
+        returns_t = torch.tensor(returns, dtype=torch.float32)
+
+        logits, values = self.net(states_t)
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(actions_t)
+        entropy = dist.entropy().mean()
+
+        advantages = returns_t - values.detach()
+
+        actor_loss = -(log_probs * advantages).mean()
+        critic_loss = nn.MSELoss()(values, returns_t)
+        loss = actor_loss + self.value_coef * critic_loss - self.entropy_coef * entropy
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+
+        # Clear rollout
+        self._states.clear()
+        self._actions.clear()
+        self._rewards.clear()
+        self._values.clear()
+        self._log_probs.clear()
+        self._dones.clear()
+
+        return loss.item()
+
+    def reset(self):
+        self.steps = 0
+        self.net._hidden = None
+        self._states.clear()
+        self._actions.clear()
+        self._rewards.clear()
+        self._values.clear()
+        self._log_probs.clear()
+        self._dones.clear()
