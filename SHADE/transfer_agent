@@ -1,0 +1,372 @@
+"""
+shade/transfer/transfer_agent.py
+
+Layer-Selective Transfer Learning for Cold-Start Adaptation (Section 4.3).
+
+Implements Algorithm 3 from the paper:
+  1. Freeze lower DQN layers (device-class-agnostic scheduling knowledge)
+  2. Warm-start class embedding and output head
+  3. Collect 200 exploratory transitions from the new device class
+  4. Fine-tune for 500 steps at η_ft = 5×10⁻⁵
+  5. EMA merge: θ_prod ← 0.1·θ_ft + 0.9·θ*
+
+Results (from paper, Section 7.5):
+  - T₉₀(SHADE) = 8,200 ± 340 steps  (5.12× fewer than DDQN: 42,000 ± 1,840)
+  - Knowledge retention: 96.3% ± 1.1% (95% CI: 94.1%–98.5%)
+  - Only 19.6% of parameters are updated during adaptation
+
+Reference: Section 4.3, Algorithm 3, Equations in Section 4.3.
+"""
+
+import copy
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from typing import Optional, List, Dict, Tuple
+from tqdm import tqdm
+
+
+class EMAWeightMerger:
+    """
+    Exponential Moving Average weight merge (Section 4.3).
+
+    θ_prod ← α·θ_finetuned + (1 - α)·θ*
+
+    With α = 0.1, the production agent retains 90% of pre-adaptation weights
+    and incorporates 10% of new class-specific updates. This mathematically
+    bounds the maximum perturbation: ‖θ_prod - θ*‖ ≤ α·‖θ_ft - θ*‖,
+    preventing catastrophic forgetting of existing class representations.
+
+    Args:
+        alpha: Blending coefficient (default 0.1 per paper).
+    """
+
+    def __init__(self, alpha: float = 0.1):
+        assert 0 < alpha < 1, f"alpha must be in (0,1), got {alpha}"
+        self.alpha = alpha
+
+    def merge(
+        self,
+        model_prod: nn.Module,
+        model_finetuned: nn.Module,
+    ) -> nn.Module:
+        """
+        Merge fine-tuned weights into the production model.
+
+        Args:
+            model_prod: Current production model θ*.
+            model_finetuned: Fine-tuned model θ_ft.
+
+        Returns:
+            Updated production model θ_prod.
+        """
+        with torch.no_grad():
+            for param_prod, param_ft in zip(
+                model_prod.parameters(), model_finetuned.parameters()
+            ):
+                param_prod.data.copy_(
+                    self.alpha * param_ft.data + (1 - self.alpha) * param_prod.data
+                )
+        return model_prod
+
+
+class LayerSelectiveTransfer:
+    """
+    Layer-selective fine-tuning for cold-start adaptation to new device classes.
+
+    The key insight is the functional specialization of DQN layers:
+    - Lower layers (FC 256-512-256): encode device-class-agnostic scheduling
+      knowledge (avoid overloaded nodes, prefer low-latency paths, etc.)
+      → FROZEN during adaptation
+    - Upper layers (class embedding + output head): encode class-specific
+      associations → FINE-TUNED during adaptation
+
+    Only ~19.6% of the ~250,000 total parameters require updating.
+
+    Args:
+        pretrained_model: Trained SHADE sub-agent θ*.
+        finetune_lr: Learning rate for fine-tuning (default 5×10⁻⁵).
+        finetune_steps: Number of gradient steps (default 500).
+        collect_steps: Exploratory transitions to collect (default 200).
+        explore_rate: Exploration rate during collection (default 0.5).
+        ema_alpha: EMA blending coefficient (default 0.1).
+        performance_threshold: Minimum retention for deployment (default 0.90).
+    """
+
+    FROZEN_LAYERS = ['fc1', 'fc2', 'fc3', 'lstm']   # Lower layers — frozen
+    TRAINABLE_LAYERS = ['class_embedding', 'output_head']  # Upper layers
+
+    def __init__(
+        self,
+        pretrained_model: nn.Module,
+        finetune_lr: float = 5e-5,
+        finetune_steps: int = 500,
+        collect_steps: int = 200,
+        explore_rate: float = 0.5,
+        ema_alpha: float = 0.1,
+        performance_threshold: float = 0.90,
+    ):
+        self.model_star = pretrained_model
+        self.finetune_lr = finetune_lr
+        self.finetune_steps = finetune_steps
+        self.collect_steps = collect_steps
+        self.explore_rate = explore_rate
+        self.ema_merger = EMAWeightMerger(alpha=ema_alpha)
+        self.performance_threshold = performance_threshold
+
+    def _freeze_lower_layers(self, model: nn.Module) -> nn.Module:
+        """
+        Freeze lower layers (device-class-agnostic scheduling knowledge).
+
+        These layers encode patterns applicable to any device class —
+        including newly introduced hardware — and do not need relearning.
+        """
+        frozen_count = 0
+        total_count = 0
+
+        for name, param in model.named_parameters():
+            total_count += param.numel()
+            layer_name = name.split('.')[0]
+            if any(fl in name for fl in self.FROZEN_LAYERS):
+                param.requires_grad = False
+                frozen_count += param.numel()
+            else:
+                param.requires_grad = True
+
+        trainable_fraction = 1 - frozen_count / total_count
+        print(f"Frozen {frozen_count:,} / {total_count:,} parameters "
+              f"({trainable_fraction * 100:.1f}% trainable)")
+
+        return model
+
+    def _collect_transitions(
+        self,
+        env,
+        new_class_nodes: List[Dict],
+        n_steps: int = 200,
+    ) -> List[Dict]:
+        """
+        Step 3 of Algorithm 3: collect cold-start transition corpus.
+
+        Deploys with ε = 0.5 exploration on new device class nodes.
+        200 transitions correspond to ~40 seconds at λ = 5 tasks/s.
+
+        Args:
+            env: Scheduling environment with new device class available.
+            new_class_nodes: List of new device class node configurations.
+            n_steps: Number of transitions to collect (default 200).
+
+        Returns:
+            transitions: List of (state, action, reward, next_state) dicts.
+        """
+        transitions = []
+        state = env.reset(nodes=new_class_nodes)
+
+        for _ in range(n_steps):
+            # ε-greedy with high exploration rate for coverage
+            if np.random.random() < self.explore_rate:
+                action = env.action_space.sample()
+            else:
+                with torch.no_grad():
+                    q_values = self.model_star(
+                        torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+                    )
+                    action = q_values.argmax(dim=1).item()
+
+            next_state, reward, done, info = env.step(action)
+            transitions.append({
+                'state': state, 'action': action,
+                'reward': reward, 'next_state': next_state, 'done': done,
+            })
+            state = env.reset() if done else next_state
+
+        return transitions
+
+    def _finetune(
+        self,
+        model: nn.Module,
+        transitions: List[Dict],
+        gamma: float = 0.99,
+    ) -> nn.Module:
+        """
+        Step 4 of Algorithm 3: layer-selective fine-tuning.
+
+        Only θ_emb and θ_head are updated. Lower layers are frozen.
+        Learning rate η_ft = 5×10⁻⁵ (10× smaller than primary η₀ = 10⁻⁴)
+        to prevent class-specific updates from overwriting frozen knowledge.
+
+        Args:
+            model: Model with frozen lower layers.
+            transitions: Cold-start transition corpus (200 samples).
+            gamma: Discount factor.
+
+        Returns:
+            Fine-tuned model.
+        """
+        optimizer = optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=self.finetune_lr,
+        )
+        loss_fn = nn.HuberLoss()
+
+        model.train()
+        for step in tqdm(range(self.finetune_steps), desc="Fine-tuning"):
+            # Sample mini-batch (64 transitions with replacement)
+            batch_idx = np.random.randint(0, len(transitions), size=64)
+            batch = [transitions[i] for i in batch_idx]
+
+            states = torch.tensor(
+                [t['state'] for t in batch], dtype=torch.float32
+            )
+            actions = torch.tensor(
+                [t['action'] for t in batch], dtype=torch.long
+            )
+            rewards = torch.tensor(
+                [t['reward'] for t in batch], dtype=torch.float32
+            )
+            next_states = torch.tensor(
+                [t['next_state'] for t in batch], dtype=torch.float32
+            )
+            dones = torch.tensor(
+                [t['done'] for t in batch], dtype=torch.float32
+            )
+
+            # TD loss (simplified — production uses Double DQN with target net)
+            q_values = model(states).gather(1, actions.unsqueeze(1)).squeeze()
+            with torch.no_grad():
+                next_q = model(next_states).max(dim=1).values
+                targets = rewards + gamma * next_q * (1 - dones)
+
+            loss = loss_fn(q_values, targets)
+            optimizer.zero_grad()
+            loss.backward()
+
+            # Gradient clip to prevent disrupting frozen layer adjacency
+            torch.nn.utils.clip_grad_norm_(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                max_norm=1.0,
+            )
+            optimizer.step()
+
+        return model
+
+    def adapt(
+        self,
+        env,
+        new_class_nodes: List[Dict],
+        eval_env=None,
+        baseline_performance: Optional[float] = None,
+    ) -> Tuple[nn.Module, Dict]:
+        """
+        Full Algorithm 3: adapt pretrained model to a new device class.
+
+        Args:
+            env: Scheduling environment with new device class.
+            new_class_nodes: Node configurations for the new class.
+            eval_env: Optional environment for retention validation.
+            baseline_performance: θ* performance on original classes
+                                  for retention calculation.
+
+        Returns:
+            theta_prod: Updated production model.
+            metrics: Dict with adaptation metrics (steps, retention).
+        """
+        print("="*60)
+        print("SHADE Transfer Learning — Algorithm 3")
+        print("="*60)
+
+        # Step 1: Create fine-tuning model (copy of pretrained)
+        model_ft = copy.deepcopy(self.model_star)
+
+        # Step 1: Freeze lower layers
+        print("\nStep 1: Freezing lower layers (device-class-agnostic knowledge)")
+        model_ft = self._freeze_lower_layers(model_ft)
+
+        # Step 2: Warm-start class embedding with small perturbation
+        print("\nStep 2: Warm-starting class embedding layer")
+        for name, param in model_ft.named_parameters():
+            if 'class_embedding' in name and param.requires_grad:
+                nn.init.normal_(param, mean=0.0, std=0.01)
+                print(f"  Perturbed: {name} ({param.numel()} params)")
+
+        # Step 3: Collect cold-start transition corpus
+        print(f"\nStep 3: Collecting {self.collect_steps} transitions "
+              f"(ε = {self.explore_rate})")
+        transitions = self._collect_transitions(
+            env, new_class_nodes, self.collect_steps
+        )
+        print(f"  Collected {len(transitions)} transitions")
+
+        # Step 4: Layer-selective fine-tuning
+        print(f"\nStep 4: Fine-tuning for {self.finetune_steps} steps "
+              f"at η_ft = {self.finetune_lr}")
+        model_ft = self._finetune(model_ft, transitions)
+
+        # Step 5: EMA merge
+        print(f"\nStep 5: EMA merge (α = {self.ema_merger.alpha})")
+        model_prod = self.ema_merger.merge(
+            copy.deepcopy(self.model_star), model_ft
+        )
+        print(f"  Production model updated: "
+              f"θ_prod = {self.ema_merger.alpha}·θ_ft + "
+              f"{1-self.ema_merger.alpha}·θ*")
+
+        # Step 6: Validate retention on original classes
+        metrics = {
+            'finetune_steps': self.finetune_steps,
+            'collect_steps': self.collect_steps,
+            'ema_alpha': self.ema_merger.alpha,
+        }
+
+        if eval_env is not None and baseline_performance is not None:
+            print("\nStep 6: Validating retention on original device classes")
+            retention = self._compute_retention(
+                model_prod, eval_env, baseline_performance
+            )
+            metrics['retention'] = retention
+            print(f"  Retention: {retention*100:.1f}%")
+
+            if retention < self.performance_threshold:
+                print(f"  WARNING: Retention {retention:.3f} < "
+                      f"threshold {self.performance_threshold}. "
+                      f"Consider collecting more transitions.")
+            else:
+                print(f"  ✓ Retention threshold met. Deploying θ_prod.")
+
+        print("\n" + "="*60)
+        return model_prod, metrics
+
+    def _compute_retention(
+        self,
+        model: nn.Module,
+        eval_env,
+        baseline_performance: float,
+        n_eval_episodes: int = 100,
+    ) -> float:
+        """
+        Compute knowledge retention on original device classes.
+
+        Retention = perf_original_classes(θ_prod) / perf_original_classes(θ*)
+        Target from paper: 96.3% ± 1.1% (95% CI: 94.1%–98.5%)
+        """
+        model.eval()
+        total_reward = 0.0
+
+        with torch.no_grad():
+            for _ in range(n_eval_episodes):
+                state = eval_env.reset()
+                episode_reward = 0.0
+                done = False
+                while not done:
+                    q_values = model(
+                        torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+                    )
+                    action = q_values.argmax(dim=1).item()
+                    state, reward, done, _ = eval_env.step(action)
+                    episode_reward += reward
+                total_reward += episode_reward
+
+        adapted_performance = total_reward / n_eval_episodes
+        retention = adapted_performance / (baseline_performance + 1e-8)
+        return float(np.clip(retention, 0.0, 1.0))
