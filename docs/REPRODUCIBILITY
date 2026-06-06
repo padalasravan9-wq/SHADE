@@ -1,0 +1,285 @@
+# SHADE Reproducibility Guide
+
+This document provides exact step-by-step instructions to reproduce every table
+and figure in the paper. All results can be reproduced on a single GPU in
+approximately 20 hours, or in parallel across multiple GPUs in 6–8 hours.
+
+---
+
+## Hardware Requirements
+
+### Minimum (simulation experiments)
+- CPU: 8+ cores
+- RAM: 32 GB
+- Storage: 50 GB (for datasets + checkpoints)
+- GPU: NVIDIA GPU with 8 GB VRAM (optional but strongly recommended)
+
+### Recommended
+- CPU: 16+ cores
+- RAM: 64 GB
+- GPU: NVIDIA A100 / RTX 3090+ (24 GB VRAM)
+
+### Physical Testbed (Section 6.6 / Table 4)
+Requires the exact hardware listed in Table 3 of the paper:
+- Class A: Raspberry Pi 4 Model B (4 GB)
+- Class B: NVIDIA Jetson Orin NX 16 GB
+- Class C: Dell PowerEdge R750 with NVIDIA A30
+- Class D: AWS c5.4xlarge instance
+
+Power measurement: TP-Link Tapo P115 (Classes A, B) + Dell iDRAC (Class C).
+
+---
+
+## Step 1 — Environment Setup
+
+```bash
+git clone https://github.com/[username]/SHADE.git
+cd SHADE
+python -m venv shade_env && source shade_env/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+Verify installation:
+```bash
+python -c "import shade; print('SHADE installed successfully')"
+python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+```
+
+---
+
+## Step 2 — Download and Preprocess Datasets
+
+### Synthetic-HET (generated locally, ~2 minutes)
+```bash
+python datasets/synthetic_het/generate.py \
+    --n_nodes 500 \
+    --n_tasks 10000 \
+    --n_seeds 30 \
+    --output data/synthetic_het/
+```
+
+### Google Cluster 2011 (~15 GB download, ~30 min preprocessing)
+```bash
+# Download (requires ~15 GB disk space)
+bash scripts/download_datasets.sh --dataset google_cluster
+
+# Preprocess to SHADE format (maps fields to τᵢ descriptor)
+python datasets/google_cluster/preprocess.py \
+    --input data/raw/google_cluster/ \
+    --output data/processed/google_cluster/
+```
+
+### Azure Functions 2023 (~5 GB download, ~15 min preprocessing)
+```bash
+bash scripts/download_datasets.sh --dataset azure_functions
+
+python datasets/azure_functions/preprocess.py \
+    --input data/raw/azure_functions/ \
+    --output data/processed/azure_functions/
+```
+
+---
+
+## Step 3 — Train SHADE (or Use Pretrained Weights)
+
+### Option A: Use pretrained weights (recommended for evaluation)
+
+Pre-trained weights are provided in `results/pretrained/`:
+```
+results/pretrained/
+  shade_synthetic_het.pt     # Trained on Synthetic-HET (best of 30 trials)
+  shade_google_cluster.pt    # Trained on Google Cluster
+  shade_azure_functions.pt   # Trained on Azure Functions
+```
+
+### Option B: Train from scratch (30 trials × 50,000 steps each)
+
+```bash
+# Single trial (for testing)
+python experiments/train_shade.py \
+    --dataset synthetic_het \
+    --n_nodes 500 \
+    --seed 42 \
+    --checkpoint_dir results/checkpoints/
+
+# All 30 trials in parallel (requires 30 GPUs or sequential ~12 hours on 1 GPU)
+bash scripts/run_training.sh --dataset synthetic_het --n_trials 30
+```
+
+---
+
+## Step 4 — Reproduce Main Results (Tables 5–7)
+
+### Table 5: Average Task Latency
+```bash
+python experiments/evaluate.py \
+    --checkpoint results/pretrained/shade_synthetic_het.pt \
+    --dataset synthetic_het \
+    --n_trials 30 \
+    --baselines fifo round_robin min_min greedy_energy ddqn ppo a3c \
+    --metric latency \
+    --output results/tables/table5_latency.csv
+```
+
+### Table 6: Energy Consumption
+```bash
+python experiments/evaluate.py \
+    --checkpoint results/pretrained/shade_synthetic_het.pt \
+    --dataset synthetic_het \
+    --metric energy \
+    --output results/tables/table6_energy.csv
+```
+
+### Table 7: SLA Violation, Task Completion, Affinity Score
+```bash
+python experiments/evaluate.py \
+    --checkpoint results/pretrained/shade_synthetic_het.pt \
+    --dataset synthetic_het \
+    --metrics sla_violation completion_rate affinity_score \
+    --output results/tables/table7_sla_affinity.csv
+```
+
+### All three datasets
+```bash
+bash scripts/run_main_evaluation.sh
+# Produces Tables 5, 6, 7 for all three datasets
+# Runtime: ~4 hours on single GPU
+```
+
+Expected output (Synthetic-HET, matches paper Table 5):
+```
+Method          | Latency (ms)    | Energy (kWh)    | SLA Viol. (%)
+----------------|-----------------|-----------------|---------------
+FIFO            | 31.3 ± 1.4     | 4.82 ± 0.18    | 11.8
+A3C             | 22.6 ± 0.8     | 3.52 ± 0.11    |  4.8
+SHADE (Ours)    | 18.4 ± 0.5     | 3.44 ± 0.09    |  3.2
+```
+
+---
+
+## Step 5 — Reproduce Scalability Results (Table 8, Figure 8)
+
+```bash
+python experiments/scalability.py \
+    --checkpoint results/pretrained/shade_synthetic_het.pt \
+    --fleet_sizes 50 200 500 1000 2000 \
+    --n_tasks 10000 \
+    --output results/tables/table8_scalability.csv
+```
+
+Expected output confirms β = 0.21 for SHADE vs 1.48 for A3C (log-log R² > 0.997).
+
+---
+
+## Step 6 — Reproduce Ablation Study (Table 9, Figure 10)
+
+```bash
+python experiments/ablation.py \
+    --dataset synthetic_het \
+    --n_trials 30 \
+    --output results/tables/table9_ablation.csv
+```
+
+This trains and evaluates 5 ablation conditions × 30 trials each.
+**Runtime: ~8 hours on single GPU.**
+
+Expected output (matches Table 9):
+```
+Configuration                    | Latency (ms)           | Cohen's d
+---------------------------------|------------------------|----------
+SHADE (Full)                     | 18.4 ± 0.5            | —
+— Heterogeneity Encoding (C1)   | 22.1 (+20.1%*, d=2.91)| 2.91
+— Hierarchical Agents            | 21.3 (+15.8%*, d=2.44)| 2.44
+— Mismatch Penalty (C2)         | 20.6 (+11.9%*, d=1.87)| 1.87
+— Dynamic Weight Adjustment      | 19.7 (+7.1%*, d=0.94) | 0.94
+
+* p < 0.001, Bonferroni-corrected (α/4 = 0.0125)
+```
+
+---
+
+## Step 7 — Reproduce Transfer Learning (Figure 9)
+
+```bash
+python experiments/transfer_learning.py \
+    --pretrained results/pretrained/shade_synthetic_het.pt \
+    --new_class fpga \
+    --n_trials 10 \
+    --output results/figures/figure9_transfer.png
+```
+
+Expected: T₉₀(SHADE) = 8,200 ± 340 steps vs T₉₀(DDQN) = 42,000 ± 1,840 steps.
+
+---
+
+## Step 8 — Statistical Verification
+
+All statistical claims in the paper can be verified:
+
+```python
+from shade.utils.statistics import (
+    bootstrap_ci, cohens_d, compare_shade_vs_baseline, power_analysis_check
+)
+
+# Verify power analysis (should give n ≥ 7)
+power_analysis_check(expected_d=1.5, alpha=0.05, power=0.80)
+
+# Verify SHADE vs FIFO latency improvement
+import numpy as np
+shade_latency = np.load('results/raw/shade_latency_synthetic_het.npy')    # (30,)
+fifo_latency  = np.load('results/raw/fifo_latency_synthetic_het.npy')     # (30,)
+
+result = compare_shade_vs_baseline(shade_latency, fifo_latency)
+print(f"Improvement: {result.improvement_pct:.1f}%")   # Should be ~41.2%
+print(f"Cohen's d: {result.cohens_d:.2f}")              # Should be ~3.84
+print(f"p-value: {result.p_value:.2e}")                 # Should be < 0.001
+```
+
+---
+
+## Reproduce All Paper Results at Once
+
+```bash
+bash scripts/run_all_experiments.sh
+```
+
+This script runs all experiments sequentially and saves results to `results/`.
+**Total runtime: ~20 hours on a single GPU.**
+
+Results are saved as:
+- CSV tables matching paper tables (Tables 5–9)
+- PNG figures matching paper figures (Figures 5–10)
+- Raw numpy arrays for custom analysis
+
+---
+
+## Common Issues
+
+### "CUDA out of memory" during training
+Reduce batch size in `configs/default.yaml`:
+```yaml
+drl:
+  batch_size: 128   # Reduce from 256
+```
+
+### Google Cluster files not found
+Ensure files match pattern `part-????-of-????.csv.gz` in the input directory.
+See download instructions at: https://github.com/google/cluster-data
+
+### Results differ slightly from paper
+Results will vary slightly across runs due to:
+1. Different hardware (GPU model affects floating-point precision)
+2. PyTorch version differences
+3. Random seed interactions
+
+All differences should be within the reported 95% CI bounds.
+
+---
+
+## Contact
+
+For reproducibility issues, please open a GitHub Issue with:
+1. Python and PyTorch versions
+2. GPU model and CUDA version
+3. Full error traceback or unexpected result values
