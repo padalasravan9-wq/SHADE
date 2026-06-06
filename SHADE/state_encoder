@@ -1,0 +1,204 @@
+"""
+shade/encoding/state_encoder.py
+
+Device-Class-Aware State Encoding (Section 4.2, Contribution C1).
+
+Implements the four-component per-node structured representation:
+  1. Learned 8-dimensional class embedding (e_class)
+  2. Class-relative normalized capability vector (phi_hat_n, Eq. 7)
+  3. Current CPU utilization ratio (load_n)
+  4. Normalized task queue depth (queue_n)
+
+Nodes are sorted in descending affinity order before concatenation.
+PCA compression is applied when N > 50 nodes (retaining 95% variance).
+
+Reference: Section 4.2, Equations 7, 12 and Section 3.2.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.decomposition import PCA
+from typing import List, Dict, Optional, Tuple
+
+from shade.encoding.class_embedding import ClassEmbedding
+from shade.encoding.pca_compressor import AffinityPCACompressor
+
+
+class DeviceClassAwareEncoder(nn.Module):
+    """
+    Encodes the full fleet state into a structured representation that
+    explicitly models device-class heterogeneity.
+
+    Args:
+        n_device_classes: Number of device classes (default 4: A, B, C, D).
+        embed_dim: Dimension of the learned class embedding (default 8).
+        capability_dim: Dimension of node capability vector phi_n (default 6).
+        pca_threshold: Apply PCA compression when N > this value (default 50).
+        pca_variance: Fraction of variance to retain in PCA (default 0.95).
+    """
+
+    CLASS_MAP = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+
+    def __init__(
+        self,
+        n_device_classes: int = 4,
+        embed_dim: int = 8,
+        capability_dim: int = 6,
+        pca_threshold: int = 50,
+        pca_variance: float = 0.95,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.capability_dim = capability_dim
+        self.pca_threshold = pca_threshold
+
+        # Component 1: learned class embedding (end-to-end trainable)
+        self.class_embedding = ClassEmbedding(n_device_classes, embed_dim)
+
+        # PCA compressor (fitted on first batch, updated periodically)
+        self.pca_compressor = AffinityPCACompressor(
+            variance_threshold=pca_variance
+        )
+
+        # Per-node representation dimension before PCA:
+        # embed_dim(8) + capability_dim(6) + load(1) + queue(1) = 16
+        self.per_node_dim = embed_dim + capability_dim + 2
+
+    def class_relative_normalize(
+        self,
+        capabilities: np.ndarray,
+        device_classes: List[str],
+    ) -> np.ndarray:
+        """
+        Class-relative min-max normalization (Eq. 7).
+
+        Normalizes each capability dimension within its device class,
+        preserving intra-class variation that global normalization collapses.
+
+        A global scale maps all Class A CPU values to near-zero (since
+        Class A throughput may be 1000× lower than Class D), making all
+        Class A nodes indistinguishable. Class-relative normalization avoids
+        this information collapse.
+
+        Args:
+            capabilities: (N, 6) array of raw hardware capability values.
+            device_classes: List of N class labels ('A', 'B', 'C', 'D').
+
+        Returns:
+            phi_hat: (N, 6) class-relative normalized capability vectors.
+        """
+        phi_hat = np.zeros_like(capabilities, dtype=np.float32)
+        unique_classes = set(device_classes)
+
+        for cls in unique_classes:
+            mask = np.array([c == cls for c in device_classes])
+            cls_caps = capabilities[mask]
+
+            cls_min = cls_caps.min(axis=0)
+            cls_max = cls_caps.max(axis=0)
+            denom = cls_max - cls_min
+
+            # Avoid division by zero for uniform capability dimensions
+            denom = np.where(denom == 0, 1.0, denom)
+            phi_hat[mask] = (cls_caps - cls_min) / denom
+
+        return phi_hat
+
+    def compute_affinity_scores(
+        self,
+        req_i: np.ndarray,
+        phi_hat: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Compute cosine similarity between task requirement vector and
+        all node capability vectors.
+
+        Used for affinity-sorted ordering before LSTM input (Section 4.2).
+        Also computes the Mismatch Penalty M_t (Eq. 15) when negated.
+
+        Args:
+            req_i: (6,) task requirement vector.
+            phi_hat: (N, 6) class-relative normalized capability matrix.
+
+        Returns:
+            scores: (N,) affinity scores in [-1, 1].
+        """
+        req_norm = np.linalg.norm(req_i)
+        phi_norms = np.linalg.norm(phi_hat, axis=1, keepdims=True)
+
+        # Avoid division by zero
+        req_safe = req_i / (req_norm + 1e-8)
+        phi_safe = phi_hat / (phi_norms + 1e-8)
+
+        scores = phi_safe @ req_safe  # (N,)
+        return scores.astype(np.float32)
+
+    def encode(
+        self,
+        task: Dict,
+        nodes: List[Dict],
+    ) -> Tuple[torch.Tensor, np.ndarray]:
+        """
+        Encode the full fleet state for a given arriving task.
+
+        Steps:
+          1. Compute class-relative normalized capability vectors (phi_hat).
+          2. Compute affinity scores for affinity-sorted ordering.
+          3. Sort nodes by affinity score (descending).
+          4. Build per-node 16-dim representation for each node.
+          5. Apply PCA compression if N > pca_threshold.
+
+        Args:
+            task: Dict with keys: cpu, mem, deadline, priority, size, type,
+                  req_vector (6-dim requirement vector).
+            nodes: List of N node dicts with keys: class, capabilities (6-dim),
+                   load, queue_depth.
+
+        Returns:
+            state: Tensor of shape (N × d) or (N × d_pca) after compression.
+            affinity_scores: (N,) array for mismatch penalty computation.
+        """
+        N = len(nodes)
+        capabilities = np.stack([n['capabilities'] for n in nodes])  # (N, 6)
+        device_classes = [n['class'] for n in nodes]
+        loads = np.array([n['load'] for n in nodes])          # (N,)
+        queues = np.array([n['queue_depth'] for n in nodes])  # (N,)
+        req_i = np.array(task['req_vector'], dtype=np.float32)  # (6,)
+
+        # Step 1: Class-relative normalization
+        phi_hat = self.class_relative_normalize(capabilities, device_classes)
+
+        # Step 2: Affinity scores
+        affinity_scores = self.compute_affinity_scores(req_i, phi_hat)
+
+        # Step 3: Sort nodes by affinity (descending)
+        sort_idx = np.argsort(-affinity_scores)
+        phi_hat = phi_hat[sort_idx]
+        loads = loads[sort_idx]
+        queues = queues[sort_idx]
+        sorted_classes = [device_classes[i] for i in sort_idx]
+        affinity_sorted = affinity_scores[sort_idx]
+
+        # Step 4: Build per-node representations
+        class_ids = torch.tensor(
+            [self.CLASS_MAP[c] for c in sorted_classes], dtype=torch.long
+        )
+        embeddings = self.class_embedding(class_ids)          # (N, 8)
+
+        phi_hat_t = torch.tensor(phi_hat, dtype=torch.float32)  # (N, 6)
+        loads_t = torch.tensor(loads, dtype=torch.float32).unsqueeze(1)   # (N,1)
+        queues_t = torch.tensor(queues, dtype=torch.float32).unsqueeze(1) # (N,1)
+
+        # Concatenate: [embed(8) | phi_hat(6) | load(1) | queue(1)] = 16-dim
+        H_t = torch.cat([embeddings, phi_hat_t, loads_t, queues_t], dim=1)  # (N, 16)
+
+        # Step 5: PCA compression for large fleets
+        if N > self.pca_threshold:
+            H_t = self.pca_compressor.compress(H_t)
+
+        return H_t, affinity_sorted
+
+    def forward(self, task: Dict, nodes: List[Dict]) -> Tuple[torch.Tensor, np.ndarray]:
+        """Alias for encode(); supports nn.Module usage."""
+        return self.encode(task, nodes)
