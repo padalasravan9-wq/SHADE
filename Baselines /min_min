@@ -1,0 +1,88 @@
+"""
+baselines/classical/min_min.py
+
+Min-Min Scheduler — Classical Baseline.
+
+Assigns each task to the node that minimises its estimated completion
+time CT(τᵢ, n) = queue_time(n) + cpu_i / CPU_n.
+
+Achieves competitive makespan under light load but systematically
+overloads the fastest nodes under burst arrivals, inducing queue
+imbalance that degrades tail latency by up to 40% in heterogeneous
+fleets (Section 2.1 of paper).
+
+Reference: Section 6.3, Table 3. Algorithm: [4] in paper.
+"""
+
+import numpy as np
+from typing import List, Dict
+
+
+class MinMinScheduler:
+    """
+    Min-Min completion-time scheduler.
+
+    Assignment rule:
+        CT(τᵢ, n) = queue_time(n) + cpu_i / CPU_n
+        n* = argmin_n CT(τᵢ, n)
+
+    This is the classic makespan-minimizing heuristic. Under light and
+    uniform load it performs well. Under bursty arrivals it routes all
+    tasks to the fastest nodes (Class C/D), saturating their queues
+    while Class A/B nodes sit idle — the opposite of optimal behaviour.
+    """
+
+    def __init__(self):
+        self.name = 'Min-Min'
+        self.total_tasks = 0
+
+    def estimate_completion_time(
+        self,
+        task: Dict,
+        node: Dict,
+    ) -> float:
+        """
+        Estimate task completion time on a given node.
+
+        CT(τᵢ, n) = queue_time(n) + cpu_i / CPU_n
+
+        Args:
+            task: Task dict with 'cpu' (normalized demand 0–1).
+            node: Node dict with 'queue_time' (ms) and 'cpu_capacity' (GHz).
+
+        Returns:
+            Estimated completion time in milliseconds.
+        """
+        cpu_demand = task.get('cpu', 0.5)
+        cpu_capacity = node.get('cpu_capacity', 1.0)
+        queue_time = node.get('queue_time', 0.0)
+
+        # Execution time inversely proportional to CPU capacity
+        exec_time = (cpu_demand / (cpu_capacity + 1e-8)) * 1000.0  # ms
+        return queue_time + exec_time
+
+    def select_node(
+        self,
+        task: Dict,
+        nodes: List[Dict],
+    ) -> int:
+        """
+        Select node that minimises estimated completion time.
+
+        Args:
+            task: Task descriptor with cpu demand.
+            nodes: List of node dicts with queue and capacity info.
+
+        Returns:
+            node_index: Index of node with minimum CT.
+        """
+        completion_times = [
+            self.estimate_completion_time(task, node)
+            for node in nodes
+        ]
+        selected = int(np.argmin(completion_times))
+        self.total_tasks += 1
+        return selected
+
+    def reset(self):
+        self.total_tasks = 0
