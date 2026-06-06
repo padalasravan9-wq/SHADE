@@ -1,0 +1,54 @@
+"""
+baselines/classical/fifo.py
+
+First-In-First-Out (FIFO) Scheduler — Classical Baseline.
+
+Assigns tasks to nodes in strict arrival order, selecting the node
+with the lowest current queue depth. No resource awareness, no
+heterogeneity consideration. Serves as the performance lower bound.
+
+Reference: Section 6.3 of paper (Table 3).
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple
+
+
+class FIFOScheduler:
+    """
+    First-In-First-Out scheduler.
+
+    Assignment rule: route each arriving task to the node with the
+    shortest current queue, breaking ties by node index. No consideration
+    of task type, node capability, energy, or SLA deadline.
+
+    This scheduler is heterogeneity-blind by design — it treats a
+    Class A microcontroller and a Class D cloud VM as identical targets.
+    """
+
+    def __init__(self):
+        self.name = 'FIFO'
+        self.total_tasks = 0
+
+    def select_node(
+        self,
+        task: Dict,
+        nodes: List[Dict],
+    ) -> int:
+        """
+        Select node with minimum queue depth (FIFO rule).
+
+        Args:
+            task: Task descriptor (ignored — FIFO is task-blind).
+            nodes: List of node dicts with 'queue_depth' key.
+
+        Returns:
+            node_index: Index of selected node in nodes list.
+        """
+        queue_depths = np.array([n['queue_depth'] for n in nodes])
+        selected = int(np.argmin(queue_depths))
+        self.total_tasks += 1
+        return selected
+
+    def reset(self):
+        self.total_tasks = 0
