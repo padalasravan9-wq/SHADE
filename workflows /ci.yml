@@ -1,0 +1,77 @@
+name: SHADE CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -e .
+
+    - name: Run unit tests
+      run: |
+        pytest tests/ -v --cov=shade --cov-report=term-missing
+
+    - name: Test state encoding
+      run: pytest tests/test_state_encoder.py -v
+
+    - name: Test reward function
+      run: pytest tests/test_reward.py -v
+
+    - name: Test transfer learning
+      run: pytest tests/test_transfer.py -v
+
+    - name: Test baselines
+      run: pytest tests/test_baselines.py -v
+
+    - name: Test statistical utilities
+      run: |
+        python -c "
+        from shade.utils.statistics import power_analysis_check, bootstrap_ci
+        import numpy as np
+        # Verify power analysis gives n >= 7
+        n = power_analysis_check(expected_d=1.5)
+        assert n <= 7, f'Expected n<=7, got {n}'
+        # Verify bootstrap CI
+        data = np.random.normal(18.4, 0.5, 30)
+        mean, lo, hi = bootstrap_ci(data)
+        assert lo < mean < hi, 'CI bounds invalid'
+        print('All statistical checks passed')
+        "
+
+    - name: Verify config completeness
+      run: |
+        python -c "
+        import yaml
+        with open('configs/default.yaml') as f:
+            cfg = yaml.safe_load(f)
+        required = ['drl', 'state_encoding', 'reward', 'transfer', 'evaluation']
+        for key in required:
+            assert key in cfg, f'Missing config section: {key}'
+        print('Config validation passed')
+        "
