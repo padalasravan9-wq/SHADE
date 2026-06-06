@@ -1,0 +1,239 @@
+"""
+baselines/drl/ddqn.py
+
+Double DQN (DDQN) Scheduler — DRL Baseline.
+
+Implements the DDQN scheduling approach from:
+    Amini, M., & Kalbasi, M. (2024). DCHPC: Dynamic container handler
+    for high-performance computing environments.
+    IEEE Access. [Reference 6 in paper]
+
+Key structural difference from SHADE:
+    - Flat homogeneous state vector: [cpu_util(n), queue_depth(n)] for all N nodes
+    - No device-class capability encoding
+    - No class embeddings — all nodes treated as instances of the same generic type
+    - Centralized: single agent observes all N nodes → O(N²) inference complexity
+    - No Mismatch Penalty in reward (single-objective or fixed-weight multi-obj)
+
+This is the state representation design that SHADE's C1 contribution
+directly addresses. The absence of phi_hat_n in the state means the agent
+cannot distinguish a Class B GPU edge server from a Class A microcontroller
+by their hardware capabilities — only by their current utilization.
+
+Paper result (Table 5):
+    Latency: 24.8 ± 1.0 ms (vs SHADE: 18.4 ± 0.5 ms, −25.8%)
+    Affinity: 0.61 (vs SHADE: 0.89, +0.28)
+
+Reference: Section 6.3, [6] in paper.
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+from typing import List, Dict, Tuple, Optional
+import random
+
+
+class HomogeneousStateEncoder:
+    """
+    Flat homogeneous state encoder used by all DRL baselines.
+
+    Encodes each node as [cpu_utilization, queue_depth] only.
+    This is the heterogeneity-blind design that SHADE replaces.
+
+    Critically, this encoder provides NO information about:
+    - Device class (A/B/C/D)
+    - GPU availability
+    - Memory capacity
+    - Capability alignment with the incoming task
+
+    State vector dimension: N × 2 (flattened)
+    """
+
+    def encode(self, task: Dict, nodes: List[Dict]) -> np.ndarray:
+        """
+        Build flat homogeneous state vector.
+
+        Args:
+            task: Task descriptor (partially used — only cpu/mem demand).
+            nodes: List of N nodes.
+
+        Returns:
+            state: (N×2,) flattened array of [cpu_util, queue_depth] per node.
+        """
+        features = []
+        for node in nodes:
+            cpu_util = float(node.get('load', 0.0))
+            queue = float(node.get('queue_depth', 0.0))
+            features.extend([cpu_util, queue])
+
+        # Append task features (cpu demand, mem demand)
+        features.append(float(task.get('cpu', 0.5)))
+        features.append(float(task.get('mem', 0.5)))
+
+        return np.array(features, dtype=np.float32)
+
+
+class DDQNNetwork(nn.Module):
+    """
+    Double DQN network for scheduling.
+
+    Standard fully-connected architecture operating on the
+    flat homogeneous state vector.
+    """
+
+    def __init__(self, state_dim: int, n_actions: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_actions),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DDQNScheduler:
+    """
+    Double DQN scheduler with flat homogeneous state representation.
+
+    Implements the DDQN baseline from [6] (Amini & Kalbasi, 2024).
+    Uses the same training hyperparameters as SHADE for fair comparison
+    (50,000 steps, batch size 256, γ = 0.99, identical training budget).
+
+    The key difference from SHADE is the state encoder:
+    SHADE uses DeviceClassAwareEncoder (16-dim per node, sorted by affinity).
+    DDQN uses HomogeneousStateEncoder (2-dim per node, no ordering).
+    """
+
+    def __init__(
+        self,
+        n_nodes: int,
+        gamma: float = 0.99,
+        lr: float = 1e-4,
+        buffer_size: int = 100000,
+        batch_size: int = 256,
+        epsilon_start: float = 1.0,
+        epsilon_end: float = 0.05,
+        epsilon_decay: float = 0.995,
+        tau: float = 0.005,
+    ):
+        self.name = 'DDQN'
+        self.n_nodes = n_nodes
+        self.gamma = gamma
+        self.batch_size = batch_size
+        self.tau = tau
+
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+
+        self.encoder = HomogeneousStateEncoder()
+
+        # State dim: N×2 node features + 2 task features
+        self.state_dim = n_nodes * 2 + 2
+        self.n_actions = n_nodes
+
+        self.online_net = DDQNNetwork(self.state_dim, self.n_actions)
+        self.target_net = DDQNNetwork(self.state_dim, self.n_actions)
+        self.target_net.load_state_dict(self.online_net.state_dict())
+
+        self.optimizer = optim.Adam(self.online_net.parameters(), lr=lr)
+        self.replay_buffer = deque(maxlen=buffer_size)
+        self.steps = 0
+
+    def select_node(
+        self,
+        task: Dict,
+        nodes: List[Dict],
+        training: bool = False,
+    ) -> int:
+        """
+        Select node using ε-greedy DDQN policy.
+
+        Args:
+            task: Arriving task descriptor.
+            nodes: Current node states.
+            training: If True, applies ε-greedy exploration.
+
+        Returns:
+            node_index: Selected node index.
+        """
+        state = self.encoder.encode(task, nodes)
+
+        if training and random.random() < self.epsilon:
+            return random.randint(0, len(nodes) - 1)
+
+        with torch.no_grad():
+            state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+            q_values = self.online_net(state_t)
+            return int(q_values.argmax(dim=1).item())
+
+    def store_transition(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ):
+        self.replay_buffer.append((state, action, reward, next_state, done))
+
+    def update(self) -> Optional[float]:
+        """
+        Double DQN update step.
+
+        Uses online network for action selection and target network
+        for value estimation — decoupling selection from evaluation.
+        """
+        if len(self.replay_buffer) < self.batch_size:
+            return None
+
+        batch = random.sample(self.replay_buffer, self.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states_t = torch.tensor(np.array(states), dtype=torch.float32)
+        actions_t = torch.tensor(actions, dtype=torch.long)
+        rewards_t = torch.tensor(rewards, dtype=torch.float32)
+        next_states_t = torch.tensor(np.array(next_states), dtype=torch.float32)
+        dones_t = torch.tensor(dones, dtype=torch.float32)
+
+        # Online network selects action
+        next_actions = self.online_net(next_states_t).argmax(dim=1, keepdim=True)
+        # Target network evaluates action (Double DQN decoupling)
+        next_q = self.target_net(next_states_t).gather(1, next_actions).squeeze()
+
+        targets = rewards_t + self.gamma * next_q * (1 - dones_t)
+        q_values = self.online_net(states_t).gather(
+            1, actions_t.unsqueeze(1)
+        ).squeeze()
+
+        loss = nn.HuberLoss()(q_values, targets.detach())
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 1.0)
+        self.optimizer.step()
+
+        # Polyak target network update
+        for p_online, p_target in zip(
+            self.online_net.parameters(), self.target_net.parameters()
+        ):
+            p_target.data.copy_(
+                self.tau * p_online.data + (1 - self.tau) * p_target.data
+            )
+
+        # Decay exploration
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+        self.steps += 1
+
+        return loss.item()
+
+    def reset(self):
+        self.epsilon = 1.0
+        self.steps = 0
+        self.replay_buffer.clear()
