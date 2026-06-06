@@ -1,0 +1,247 @@
+"""
+shade/reward/reward_function.py
+
+Heterogeneity-Weighted Multi-Objective Reward Function (Section 3.4).
+
+Implements the five-term reward (Eq. 11):
+    R(S_t, A_t) = -λ₁L̃_t - λ₂Ẽ_t - λ₃V_t - λ₄O_t - λ₅M_t
+
+where:
+  L̃_t = normalized latency (Eq. 12)
+  Ẽ_t = normalized energy (Eq. 13)
+  V_t  = SLA violation indicator ∈ {0, 1}
+  O_t  = overload penalty (Eq. 14)
+  M_t  = Mismatch Penalty (Eq. 15) — NOVEL CONTRIBUTION
+
+The Pareto weights {λ_k} are initialized uniformly (0.2 each) and updated
+dynamically via cumulative regret tracking (Eq. 16) to maintain balanced
+optimization across objectives that differ by four orders of magnitude.
+
+Reference: Equations 11–16, Section 3.4.
+"""
+
+import numpy as np
+import torch
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+
+@dataclass
+class RewardComponents:
+    """Stores all five reward term values for logging and analysis."""
+    latency_norm: float      # L̃_t ∈ [0, 1]
+    energy_norm: float       # Ẽ_t ∈ [0, 1]
+    sla_violation: float     # V_t ∈ {0, 1}
+    overload_penalty: float  # O_t ∈ [0, ∞)
+    mismatch_penalty: float  # M_t ∈ [0, 2]
+    total_reward: float      # R(S_t, A_t)
+    weights: np.ndarray      # Current λ₁…λ₅
+
+
+class MismatchPenalty:
+    """
+    Novel cosine-distance Mismatch Penalty (Eq. 15).
+
+    M_t = 1 - cos(req_i, φ̂_{nj})
+        = 1 - (req_i · φ̂_{nj}) / (‖req_i‖₂ · ‖φ̂_{nj}‖₂)  ∈ [0, 2]
+
+    Interpretation:
+      M_t = 0.0  → perfect capability alignment (e.g., GPU task to GPU node)
+      M_t = 1.0  → complete orthogonality (e.g., GPU task to CPU-only node)
+      M_t = 2.0  → maximum possible mismatch (anti-aligned vectors)
+
+    For a GPU-accelerated task (gpu_req = 1.0) assigned to a CPU-only
+    Class A node (gpu_cap = 0.0), the penalty is M_t = 1.0 — providing
+    a strong negative reward signal that Greedy-Energy cannot generate.
+
+    Reference: Eq. 15, Section 3.4.
+    """
+
+    @staticmethod
+    def compute(req_i: np.ndarray, phi_hat_nj: np.ndarray) -> float:
+        """
+        Compute the Mismatch Penalty between task requirements and node capabilities.
+
+        Args:
+            req_i: (6,) task requirement vector. Components:
+                   [cpu_i/CPU_max, gpu_req_i, mem_i/MEM_max,
+                    stor_i/STOR_max, 0, 0]
+                   where gpu_req_i = 1 for GPU-accelerated tasks, 0 otherwise.
+            phi_hat_nj: (6,) class-relative normalized node capability vector.
+
+        Returns:
+            M_t: Mismatch Penalty ∈ [0, 2].
+        """
+        req_norm = np.linalg.norm(req_i)
+        phi_norm = np.linalg.norm(phi_hat_nj)
+
+        if req_norm < 1e-8 or phi_norm < 1e-8:
+            return 1.0  # Undefined alignment defaults to maximum orthogonality
+
+        cosine_sim = np.dot(req_i, phi_hat_nj) / (req_norm * phi_norm)
+        cosine_sim = np.clip(cosine_sim, -1.0, 1.0)
+        return float(1.0 - cosine_sim)  # M_t ∈ [0, 2]
+
+
+class HeterogeneityWeightedReward:
+    """
+    Five-term heterogeneity-weighted multi-objective reward (Eq. 11).
+
+    All terms are normalized to [0, 1] before weighting to ensure
+    commensurability across four-orders-of-magnitude hardware scale differences.
+
+    Args:
+        lambda_init: Initial Pareto weight for each objective (default 0.2).
+        eta_lambda: Learning rate for Pareto weight updates.
+        history_window: Window for computing per-objective running statistics.
+    """
+
+    N_OBJECTIVES = 5
+
+    def __init__(
+        self,
+        lambda_init: float = 0.2,
+        eta_lambda: float = 0.01,
+        history_window: int = 100,
+    ):
+        # Initialize Pareto weights uniformly on the probability simplex
+        self.weights = np.full(self.N_OBJECTIVES, lambda_init, dtype=np.float32)
+        assert abs(self.weights.sum() - 1.0) < 1e-6, "Weights must sum to 1"
+
+        self.eta_lambda = eta_lambda
+        self.history_window = history_window
+
+        # Running statistics for normalization
+        self._latency_history: list = []
+        self._energy_history: list = []
+
+        # Cumulative regret for Pareto weight update (Eq. 16)
+        self._cumulative_regret = np.zeros(self.N_OBJECTIVES, dtype=np.float32)
+
+        self.mismatch_penalty = MismatchPenalty()
+
+    def compute_normalized_latency(self, latency: float) -> float:
+        """
+        Normalized latency L̃_t (Eq. 12):
+            L̃_t = (l_t - l_min) / (l_max - l_min)
+        """
+        self._latency_history.append(latency)
+        if len(self._latency_history) > self.history_window:
+            self._latency_history.pop(0)
+
+        l_min = min(self._latency_history)
+        l_max = max(self._latency_history)
+        if l_max == l_min:
+            return 0.0
+        return float((latency - l_min) / (l_max - l_min))
+
+    def compute_normalized_energy(self, energy: float) -> float:
+        """
+        Normalized energy Ẽ_t (Eq. 13):
+            Ẽ_t = (e_t - e_min) / (e_max - e_min)
+        """
+        self._energy_history.append(energy)
+        if len(self._energy_history) > self.history_window:
+            self._energy_history.pop(0)
+
+        e_min = min(self._energy_history)
+        e_max = max(self._energy_history)
+        if e_max == e_min:
+            return 0.0
+        return float((energy - e_min) / (e_max - e_min))
+
+    def compute_overload_penalty(
+        self,
+        cpu_demand: float,
+        cpu_capacity: float,
+    ) -> float:
+        """
+        Overload penalty O_t (Eq. 14):
+            O_t = max(0, (cpu_demand - CPU_nj) / CPU_nj)
+        """
+        if cpu_capacity <= 0:
+            return 1.0
+        return float(max(0.0, (cpu_demand - cpu_capacity) / cpu_capacity))
+
+    def compute(
+        self,
+        task: Dict,
+        node: Dict,
+        outcome: Dict,
+    ) -> RewardComponents:
+        """
+        Compute the full five-term reward for a scheduling decision.
+
+        Args:
+            task: Task descriptor including req_vector (6-dim).
+            node: Assigned node including phi_hat (6-dim normalized cap vector).
+            outcome: Execution outcome dict with keys:
+                     latency (ms), energy (Wh), deadline_met (bool),
+                     cpu_demand (fraction), cpu_capacity (fraction).
+
+        Returns:
+            RewardComponents with all five terms and total reward.
+        """
+        # Term 1: Normalized latency L̃_t (Eq. 12)
+        L_t = self.compute_normalized_latency(outcome['latency'])
+
+        # Term 2: Normalized energy Ẽ_t (Eq. 13)
+        E_t = self.compute_normalized_energy(outcome['energy'])
+
+        # Term 3: SLA violation V_t ∈ {0, 1}
+        V_t = 0.0 if outcome['deadline_met'] else 1.0
+
+        # Term 4: Overload penalty O_t (Eq. 14)
+        O_t = self.compute_overload_penalty(
+            outcome['cpu_demand'], outcome['cpu_capacity']
+        )
+
+        # Term 5: Mismatch Penalty M_t (Eq. 15) — Novel contribution
+        M_t = self.mismatch_penalty.compute(
+            np.array(task['req_vector'], dtype=np.float32),
+            np.array(node['phi_hat'], dtype=np.float32),
+        )
+
+        # Weighted sum (Eq. 11) — all terms enter with negative sign
+        terms = np.array([L_t, E_t, V_t, O_t, M_t], dtype=np.float32)
+        total_reward = float(-np.dot(self.weights, terms))
+
+        return RewardComponents(
+            latency_norm=L_t,
+            energy_norm=E_t,
+            sla_violation=V_t,
+            overload_penalty=O_t,
+            mismatch_penalty=M_t,
+            total_reward=total_reward,
+            weights=self.weights.copy(),
+        )
+
+    def update_pareto_weights(self, reward_components: RewardComponents) -> None:
+        """
+        Dynamic Pareto weight update via multiplicative weight (online mirror
+        descent) with cumulative regret tracking (Eq. 16).
+
+        Objectives underperforming relative to their Pareto-optimal potential
+        receive increased weight. The denominator enforces the simplex
+        constraint Σ_k λ_k = 1 at all times.
+
+        Args:
+            reward_components: Reward breakdown from the most recent step.
+        """
+        terms = np.array([
+            reward_components.latency_norm,
+            reward_components.energy_norm,
+            reward_components.sla_violation,
+            reward_components.overload_penalty,
+            reward_components.mismatch_penalty,
+        ], dtype=np.float32)
+
+        # Accumulate per-objective regret
+        optimal_per_obj = terms.min()  # Best achievable (Pareto reference)
+        self._cumulative_regret += (terms - optimal_per_obj)
+
+        # Multiplicative weight update
+        updated = self.weights * np.exp(self.eta_lambda * self._cumulative_regret)
+
+        # Project back to simplex (normalize)
+        self.weights = updated / updated.sum()
