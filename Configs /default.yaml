@@ -1,0 +1,129 @@
+# SHADE Hyperparameter Configuration
+# Corresponds exactly to Table 5 in the paper.
+# All values are fixed across all three datasets — no dataset-specific tuning.
+
+# ── Environment ─────────────────────────────────────────────────────────────
+env:
+  n_device_classes: 4          # Classes A, B, C, D
+  lambda_arrival: 5.0          # Poisson arrival rate (tasks/s)
+  task_types:                  # Four task types
+    - compute_intensive
+    - latency_sensitive
+    - gpu_accelerated
+    - storage_heavy
+  deadline_range: [50, 500]    # SLA deadline range (ms)
+  fleet_size: 500              # Default fleet size for training
+
+# ── Device Class Hardware Profiles ──────────────────────────────────────────
+device_classes:
+  A:  # Microcontroller (Raspberry Pi 4)
+    cpu_range: [1.0, 2.0]      # GHz
+    mem_range: [0.5, 4.0]      # GB
+    gpu: false
+    tdp_range: [1, 5]          # Watts
+    latency_class: local
+  B:  # Edge server (Jetson Orin NX)
+    cpu_range: [2.0, 3.2]
+    mem_range: [4.0, 16.0]
+    gpu: true
+    tdp_range: [10, 65]
+    latency_class: edge
+  C:  # Workstation (Dell PowerEdge R750)
+    cpu_range: [2.1, 3.6]
+    mem_range: [32.0, 128.0]
+    gpu: true
+    tdp_range: [100, 300]
+    latency_class: edge
+  D:  # Cloud VM (AWS c5.4xlarge)
+    cpu_range: [3.0, 3.9]
+    mem_range: [16.0, 96.0]
+    gpu: false
+    tdp_range: [50, 200]
+    latency_class: cloud        # 80–200 ms RTT
+
+# ── DRL Core Hyperparameters ─────────────────────────────────────────────────
+drl:
+  gamma: 0.99                  # Discount factor
+  lr: 1.0e-4                   # Adam learning rate (η₀)
+  lr_patience: 500             # Steps before LR halving on plateau
+  lr_min: 5.0e-5               # Minimum learning rate
+  buffer_size: 100000          # Replay buffer capacity (~20 arrival cycles)
+  batch_size: 256              # Minibatch size for gradient updates
+  t_max: 50000                 # Total training steps
+  t_soft: 1.0                  # Inference softmax temperature (Eq. 9)
+
+# ── Exploration ──────────────────────────────────────────────────────────────
+exploration:
+  epsilon_start: 1.0           # Initial exploration rate
+  epsilon_end: 0.05            # Final exploration rate
+  epsilon_decay: 0.995         # Per-step exponential decay
+
+# ── Target Network ───────────────────────────────────────────────────────────
+target_network:
+  tau: 0.005                   # Polyak averaging coefficient
+
+# ── Prioritized Experience Replay ────────────────────────────────────────────
+per:
+  alpha: 0.6                   # Prioritization exponent (standard value)
+  beta_start: 0.4              # IS correction start value
+  beta_end: 1.0                # IS correction end value (annealed over training)
+  epsilon: 1.0e-6              # Small constant for numerical stability
+
+# ── Meta-Agent Architecture ──────────────────────────────────────────────────
+meta_agent:
+  hidden_dims: [128, 128]      # FC(128)×2 + ReLU
+  activation: relu
+
+# ── Sub-Agent Architecture ───────────────────────────────────────────────────
+sub_agent:
+  hidden_dims: [256, 512, 256] # Three FC layers
+  lstm_hidden: 128             # LSTM layer for temporal patterns
+  activation: relu
+
+# ── State Encoding (Section 4.2) ─────────────────────────────────────────────
+state_encoding:
+  embed_dim: 8                 # Class embedding dimension
+  pca_variance: 0.95           # Retain 95% explained variance
+  pca_threshold: 50            # Apply PCA only when N > 50 nodes
+  per_node_dim: 16             # Concatenated per-node representation size
+
+# ── Reward Function (Eq. 11–15) ──────────────────────────────────────────────
+reward:
+  lambda_init: 0.2             # Initial Pareto weights (uniform: 1/5 each)
+  lambda_aux: 0.1              # Auxiliary affinity loss weight
+
+# ── Sparse Gradient Sharing (Section 4.5) ────────────────────────────────────
+gradient_sharing:
+  top_k: 32                    # Top-k gradient components to share
+  merge_lr_ratio: 0.5          # Neighbor merge LR = η₀ × ratio (η₀/2)
+
+# ── Transfer Learning (Section 4.3 / Algorithm 3) ────────────────────────────
+transfer:
+  collect_steps: 200           # Transitions for cold-start corpus
+  finetune_steps: 500          # Fine-tuning gradient steps
+  finetune_lr: 5.0e-5          # Fine-tuning learning rate (η_ft)
+  ema_alpha: 0.1               # EMA blending coefficient (α)
+  explore_rate: 0.5            # Exploration rate during corpus collection
+  trainable_fraction: 0.196    # Fraction of params updated (embedding + head)
+  performance_threshold: 0.90  # Minimum retention before deployment
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+evaluation:
+  n_trials: 30                 # Independent trials per condition
+  ci_level: 0.95               # Bootstrap confidence interval level
+  bonferroni_n: 4              # Number of ablation comparisons
+  alpha: 0.05                  # Base significance threshold
+  n_bootstrap: 10000           # Bootstrap resamples for CI
+
+# ── Experiment Settings ───────────────────────────────────────────────────────
+experiment:
+  seed: 42                     # Base random seed
+  save_freq: 5000              # Checkpoint every N steps
+  eval_freq: 2500              # Evaluate every N steps
+  log_dir: results/logs/
+  checkpoint_dir: results/checkpoints/
+
+# ── Scalability Experiment ────────────────────────────────────────────────────
+scalability:
+  fleet_sizes: [50, 200, 500, 1000, 2000]
+  n_tasks: 10000
