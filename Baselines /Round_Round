@@ -1,0 +1,57 @@
+"""
+baselines/classical/round_robin.py
+
+Round-Robin Scheduler — Classical Baseline.
+
+Distributes tasks cyclically across all available nodes regardless
+of current load, task type, or node capability. Achieves statistical
+load balance over time but is heterogeneity-blind.
+
+Reference: Section 6.3 of paper (Table 3).
+"""
+
+from typing import List, Dict
+
+
+class RoundRobinScheduler:
+    """
+    Round-Robin scheduler.
+
+    Assignment rule: cycle through nodes in fixed order, assigning
+    one task per node per round. Every node receives an equal share
+    of tasks regardless of its computational capability.
+
+    Class A microcontrollers and Class D cloud VMs receive the same
+    number of assignments, causing systematic overloading of
+    resource-constrained nodes and underutilization of capable ones.
+    """
+
+    def __init__(self, n_nodes: int):
+        self.name = 'Round-Robin'
+        self.n_nodes = n_nodes
+        self.counter = 0
+        self.total_tasks = 0
+
+    def select_node(
+        self,
+        task: Dict,
+        nodes: List[Dict],
+    ) -> int:
+        """
+        Select next node in cyclic order.
+
+        Args:
+            task: Task descriptor (ignored — Round-Robin is task-blind).
+            nodes: List of available nodes.
+
+        Returns:
+            node_index: Index of selected node.
+        """
+        selected = self.counter % len(nodes)
+        self.counter += 1
+        self.total_tasks += 1
+        return selected
+
+    def reset(self):
+        self.counter = 0
+        self.total_tasks = 0
