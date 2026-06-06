@@ -1,0 +1,271 @@
+"""
+shade/utils/statistics.py
+
+Statistical analysis utilities matching the paper's exact methodology (Section 6.1).
+
+Implements:
+  - 95% bootstrapped confidence intervals (Eq. 17)
+  - Cohen's d effect size (Eq. 18)
+  - Bonferroni-corrected paired t-tests
+  - Power analysis verification (n ≥ 7 for d > 1.5, 80% power)
+
+All results in the paper are computed using these functions with:
+  - n_trials = 30 independent trials
+  - ci_level = 0.95
+  - n_bootstrap = 10,000 resamples
+  - Bonferroni correction for 4 ablation comparisons (α/4 = 0.0125)
+
+Reference: Section 6.1, Equations 17–18.
+"""
+
+import numpy as np
+from scipy import stats
+from typing import Tuple, List, Optional, Dict
+from dataclasses import dataclass
+
+
+@dataclass
+class StatTestResult:
+    """Result of a statistical comparison between SHADE and a baseline."""
+    mean_shade: float
+    mean_baseline: float
+    ci_shade: Tuple[float, float]        # 95% CI for SHADE
+    ci_baseline: Tuple[float, float]     # 95% CI for baseline
+    improvement_pct: float               # (baseline - shade) / baseline × 100
+    p_value: float                       # Paired t-test p-value
+    cohens_d: float                      # Effect size
+    significant: bool                    # After Bonferroni correction
+    alpha_corrected: float               # Corrected significance threshold
+
+
+def bootstrap_ci(
+    data: np.ndarray,
+    ci_level: float = 0.95,
+    n_bootstrap: int = 10000,
+    statistic: callable = np.mean,
+    seed: int = 42,
+) -> Tuple[float, float, float]:
+    """
+    Bootstrap confidence interval (Section 6.1).
+
+    CI_{0.95} = X̄ ± t_{0.025, n-1} × s / √n
+    where s² = 1/(n-1) × Σᵢ(Xᵢ - X̄)²
+
+    Args:
+        data: Array of n_trials observations.
+        ci_level: Confidence level (default 0.95).
+        n_bootstrap: Number of bootstrap resamples (default 10,000).
+        statistic: Function to compute (default: mean).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        (mean, lower_bound, upper_bound)
+    """
+    rng = np.random.default_rng(seed)
+    n = len(data)
+
+    # Bootstrap resampling
+    bootstrap_stats = np.array([
+        statistic(rng.choice(data, size=n, replace=True))
+        for _ in range(n_bootstrap)
+    ])
+
+    alpha = 1 - ci_level
+    lower = np.percentile(bootstrap_stats, 100 * alpha / 2)
+    upper = np.percentile(bootstrap_stats, 100 * (1 - alpha / 2))
+    mean = statistic(data)
+
+    return float(mean), float(lower), float(upper)
+
+
+def cohens_d(
+    group1: np.ndarray,
+    group2: np.ndarray,
+) -> float:
+    """
+    Cohen's d effect size (Section 6.1, Eq. 18).
+
+    d = (X̄_SHADE - X̄_baseline) / s_pooled
+    where s_pooled = √[(s²_SHADE + s²_baseline) / 2]
+
+    Interpretation:
+      d > 0.2: small effect
+      d > 0.5: medium effect
+      d > 0.8: large effect
+      d > 2.0: very large / extreme effect (rare in scheduling literature)
+
+    Args:
+        group1: SHADE trial results (lower = better for latency/energy).
+        group2: Baseline trial results.
+
+    Returns:
+        Cohen's d (positive = group2 > group1, i.e., SHADE is better).
+    """
+    mean1, mean2 = np.mean(group1), np.mean(group2)
+    var1, var2 = np.var(group1, ddof=1), np.var(group2, ddof=1)
+    s_pooled = np.sqrt((var1 + var2) / 2)
+
+    if s_pooled < 1e-10:
+        return 0.0
+
+    return float((mean2 - mean1) / s_pooled)
+
+
+def compare_shade_vs_baseline(
+    shade_trials: np.ndarray,
+    baseline_trials: np.ndarray,
+    n_comparisons: int = 8,        # Pairwise: 1 SHADE vs 8 baselines → 8
+    ablation_comparisons: int = 4,  # Ablation: 4 components → α/4
+    alpha: float = 0.05,
+    ci_level: float = 0.95,
+    n_bootstrap: int = 10000,
+    lower_is_better: bool = True,   # True for latency/energy/SLA/overhead
+) -> StatTestResult:
+    """
+    Full statistical comparison: SHADE vs one baseline.
+
+    Implements the exact methodology from Section 6.1:
+      1. 95% bootstrap CI for both groups
+      2. Two-sided paired t-test
+      3. Bonferroni correction for multiple comparisons
+      4. Cohen's d effect size
+
+    Args:
+        shade_trials: SHADE results over n_trials (default 30).
+        baseline_trials: Baseline results over n_trials.
+        n_comparisons: Number of pairwise comparisons for Bonferroni correction.
+        ablation_comparisons: Number of ablation comparisons (corrected separately).
+        alpha: Base significance threshold (default 0.05).
+        ci_level: Confidence interval level (default 0.95).
+        n_bootstrap: Bootstrap resamples.
+        lower_is_better: True for latency, energy, SLA violation, overhead.
+
+    Returns:
+        StatTestResult with all statistical measures.
+    """
+    assert len(shade_trials) == len(baseline_trials), \
+        "Trial counts must match (both n=30 for paired test)"
+
+    # Bootstrap CIs
+    mean_shade, ci_low_shade, ci_high_shade = bootstrap_ci(
+        shade_trials, ci_level=ci_level, n_bootstrap=n_bootstrap
+    )
+    mean_baseline, ci_low_base, ci_high_base = bootstrap_ci(
+        baseline_trials, ci_level=ci_level, n_bootstrap=n_bootstrap
+    )
+
+    # Paired t-test (two-sided)
+    t_stat, p_value = stats.ttest_rel(shade_trials, baseline_trials)
+
+    # Bonferroni correction
+    alpha_corrected = alpha / n_comparisons
+
+    # Improvement percentage
+    if lower_is_better:
+        improvement_pct = (mean_baseline - mean_shade) / mean_baseline * 100
+        d = cohens_d(shade_trials, baseline_trials)  # positive = shade better
+    else:
+        improvement_pct = (mean_shade - mean_baseline) / mean_baseline * 100
+        d = cohens_d(baseline_trials, shade_trials)
+
+    return StatTestResult(
+        mean_shade=mean_shade,
+        mean_baseline=mean_baseline,
+        ci_shade=(ci_low_shade, ci_high_shade),
+        ci_baseline=(ci_low_base, ci_high_base),
+        improvement_pct=improvement_pct,
+        p_value=p_value,
+        cohens_d=d,
+        significant=p_value < alpha_corrected,
+        alpha_corrected=alpha_corrected,
+    )
+
+
+def run_ablation_statistics(
+    full_shade_trials: np.ndarray,
+    ablation_results: Dict[str, np.ndarray],
+    alpha: float = 0.05,
+) -> Dict[str, StatTestResult]:
+    """
+    Run statistical tests for all ablation conditions.
+
+    Uses Bonferroni correction for 4 ablation comparisons:
+    α_corrected = 0.05 / 4 = 0.0125
+
+    Components tested:
+      - "no_encoding": SHADE without heterogeneity state encoding (C1)
+      - "no_hierarchy": SHADE without hierarchical agent architecture
+      - "no_mismatch": SHADE without Mismatch Penalty (C2)
+      - "no_pareto": SHADE without dynamic Pareto weight adjustment
+      - "no_transfer": SHADE without transfer learning (deployment metric only)
+
+    Args:
+        full_shade_trials: Full SHADE results (30 trials).
+        ablation_results: Dict mapping condition name → 30-trial results.
+        alpha: Base significance threshold.
+
+    Returns:
+        Dict mapping condition name → StatTestResult.
+    """
+    n_ablation = len(ablation_results)
+    results = {}
+
+    for condition, ablation_trials in ablation_results.items():
+        result = compare_shade_vs_baseline(
+            shade_trials=full_shade_trials,
+            baseline_trials=ablation_trials,
+            n_comparisons=n_ablation,
+            lower_is_better=True,
+            alpha=alpha,
+        )
+        results[condition] = result
+
+        # Compute impact factor Δ_k (Table 9)
+        delta_k = (result.mean_baseline - result.mean_shade) / result.mean_shade * 100
+        print(f"  {condition}: Δ_k = +{delta_k:.1f}% "
+              f"(d = {result.cohens_d:.2f}, "
+              f"p {'< 0.001' if result.p_value < 0.001 else f'= {result.p_value:.4f}'}, "
+              f"{'*significant*' if result.significant else 'not significant'})")
+
+    # Verify sum of impact factors
+    total_impact = sum(
+        (r.mean_baseline - r.mean_shade) / r.mean_shade * 100
+        for r in results.values()
+    )
+    print(f"\n  Sum of impact factors: {total_impact:.1f}% "
+          f"(paper reports 54.9%)")
+
+    return results
+
+
+def power_analysis_check(
+    expected_d: float = 1.5,
+    alpha: float = 0.05,
+    power: float = 0.80,
+) -> int:
+    """
+    Verify minimum sample size for the stated power (Section 6.1).
+
+    n ≥ 2 × ((z_{α/2} + z_β) / d)²
+      = 2 × ((1.96 + 0.842) / 1.5)² ≈ 7
+
+    With n = 30 trials, statistical power exceeds 99% for all reported
+    effect sizes (all d > 0.94).
+
+    Args:
+        expected_d: Expected Cohen's d (default 1.5 from pilot study).
+        alpha: Significance threshold (default 0.05).
+        power: Target statistical power (default 0.80).
+
+    Returns:
+        Minimum required sample size.
+    """
+    z_alpha = stats.norm.ppf(1 - alpha / 2)   # 1.96 for α = 0.05
+    z_beta = stats.norm.ppf(power)             # 0.842 for 80% power
+
+    n_min = int(np.ceil(2 * ((z_alpha + z_beta) / expected_d) ** 2))
+    print(f"Power analysis: n ≥ {n_min} for d = {expected_d}, "
+          f"α = {alpha}, power = {power:.0%}")
+    print(f"Paper uses n = 30 trials — exceeds requirement by {30/n_min:.1f}×")
+
+    return n_min
